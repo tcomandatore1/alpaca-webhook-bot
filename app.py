@@ -31,7 +31,7 @@ def webhook():
         "side": action,
         "type": "market",
         "time_in_force": "gtc",
-        "extended_hours": True 
+        "extended_hours": False 
     }
 
     response = requests.post(f"{BASE_URL}/v2/orders", json=order, headers=HEADERS)
