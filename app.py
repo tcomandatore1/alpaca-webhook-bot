@@ -6,12 +6,16 @@ app = Flask(__name__)
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"  # or live-api if real money
+BASE_URL = "https://paper-api.alpaca.markets"
 
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
 }
+
+def position_exists(symbol):
+    response = requests.get(f"{BASE_URL}/v2/positions/{symbol}", headers=HEADERS)
+    return response.status_code == 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -24,6 +28,12 @@ def webhook():
 
     if action not in ["buy", "sell"]:
         return jsonify({"error": "Invalid action"}), 400
+
+    if action == "sell":
+        if not position_exists(symbol):
+            msg = f"No open position in {symbol}, skipping sell order."
+            print(msg)
+            return jsonify({"message": msg}), 200
 
     order = {
         "symbol": symbol,
