@@ -14,7 +14,7 @@ STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
 
 # --- Trade Size Configuration ---
 # This will now be used as the "notional" value for each trade.
-TRADE_DOLLAR_AMOUNT = float(os.environ.get("TRADE_DOLLAR_AMOUNT", "100.0"))
+TRADE_DOLLAR_AMOUNT = float(os.environ.get("TRADE_DOLLAR_AMOUNT", "5000.0"))
 
 
 HEADERS = {
