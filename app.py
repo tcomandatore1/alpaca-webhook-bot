@@ -38,10 +38,14 @@ def position_exists(symbol):
             raise
 
 def get_buying_power():
-    """Retrieves the current 'daytrading_buying_power'."""
+    """
+    Retrieves the 'regt_buying_power'. This is more reliable for both
+    long and short positions than 'daytrading_buying_power'.
+    """
     account_response = requests.get(f"{BASE_URL}/v2/account", headers=HEADERS)
     account_response.raise_for_status()
-    return float(account_response.json()["daytrading_buying_power"])
+    # Use the buying power figure that matches the dashboard
+    return float(account_response.json()["regt_buying_power"])
 
 def close_position(symbol):
     """Closes the entire position for a given symbol."""
