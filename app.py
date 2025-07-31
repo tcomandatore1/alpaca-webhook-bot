@@ -12,9 +12,9 @@ BASE_URL = "https://paper-api.alpaca.markets"
 # --- Strategy Configuration ---
 STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
 
-# --- Trade Size Configuration ---
-# This will now be used as the "notional" value for each trade.
-TRADE_DOLLAR_AMOUNT = float(os.environ.get("TRADE_DOLLAR_AMOUNT", "5000.0"))
+# --- NEW: Trade Size Configuration ---
+# Set the fixed number of shares for each trade. Defaults to 100 if not set.
+TRADE_QUANTITY = int(os.environ.get("TRADE_QUANTITY", "100"))
 
 
 HEADERS = {
@@ -36,16 +36,6 @@ def position_exists(symbol):
         else:
             print(f"Error checking position for {symbol}: {e.response.text}")
             raise
-
-def get_buying_power():
-    """
-    Retrieves the 'regt_buying_power'. This is more reliable for both
-    long and short positions than 'daytrading_buying_power'.
-    """
-    account_response = requests.get(f"{BASE_URL}/v2/account", headers=HEADERS)
-    account_response.raise_for_status()
-    # Use the buying power figure that matches the dashboard
-    return float(account_response.json()["regt_buying_power"])
 
 def close_position(symbol):
     """Closes the entire position for a given symbol."""
@@ -92,37 +82,24 @@ def webhook():
             print(msg)
             return jsonify({"message": msg}), 200
 
-        try:
-            # --- MODIFIED: NOTIONAL ORDER LOGIC ---
-            buying_power = get_buying_power()
-            notional_value = TRADE_DOLLAR_AMOUNT
-            
-            # Safety Check: Ensure trade amount doesn't exceed buying power
-            if notional_value > buying_power:
-                msg = f"Trade amount ${notional_value:.2f} exceeds buying power ${buying_power:.2f}. Skipping."
-                print(msg)
-                return jsonify({"message": msg}), 200
-
-            # We no longer need to get the price and calculate quantity beforehand.
-            # We will submit a 'notional' order directly.
-            order_data = {
-                "symbol": symbol,
-                "notional": str(notional_value), # Must be a string for the API
-                "side": entry_action,
-                "type": "market",
-                "time_in_force": "day",
-            }
-        
-        except Exception as e:
-            print(f"An unexpected error occurred during order preparation: {e}")
-            return jsonify({"error": str(e)}), 500
+        # --- MODIFIED: FIXED QUANTITY ORDER LOGIC ---
+        # The logic is now much simpler. We send a fixed quantity order and
+        # let Alpaca's API reject it if there isn't enough buying power.
+        order_data = {
+            "symbol": symbol,
+            "qty": TRADE_QUANTITY,
+            "side": entry_action,
+            "type": "market",
+            "time_in_force": "day",
+        }
 
         try:
             order_response = requests.post(f"{BASE_URL}/v2/orders", json=order_data, headers=HEADERS)
             order_response.raise_for_status()
-            print(f"Notional entry order ({entry_action}) for ${notional_value} of {symbol} placed successfully.")
-            return jsonify({"message": "Notional order placed", "data": order_response.json()}), order_response.status_code
+            print(f"Entry order ({entry_action}) for {TRADE_QUANTITY} shares of {symbol} placed successfully.")
+            return jsonify({"message": "Entry order placed", "data": order_response.json()}), order_response.status_code
         except requests.exceptions.HTTPError as e:
+            # This will catch errors from Alpaca, such as insufficient buying power.
             print(f"Error placing entry order: {e.response.text}")
             return jsonify({"error": f"Failed to place entry order: {e.response.text}"}), e.response.status_code
             
