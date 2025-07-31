@@ -5,14 +5,16 @@ import os
 app = Flask(__name__)
 
 # --- Alpaca API Configuration ---
-# Ensure these are set in your Render environment variables
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets"
 
 # --- Strategy Configuration ---
-# Set this in Render: "long" for your long account, "short" for your short account
 STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
+
+# --- Trade Size Configuration ---
+# This will now be used as the "notional" value for each trade.
+TRADE_DOLLAR_AMOUNT = float(os.environ.get("TRADE_DOLLAR_AMOUNT", "100.0"))
 
 
 HEADERS = {
@@ -40,27 +42,6 @@ def get_buying_power():
     account_response = requests.get(f"{BASE_URL}/v2/account", headers=HEADERS)
     account_response.raise_for_status()
     return float(account_response.json()["daytrading_buying_power"])
-
-def get_latest_price(symbol):
-    """
-    Retrieves the latest bar's close price for a symbol.
-    This is more reliable for all account types than the 'quotes' endpoint.
-    """
-    try:
-        # Use the /bars/latest endpoint which is universally available
-        bar_url = f"{BASE_URL}/v2/stocks/{symbol}/bars/latest"
-        
-        # We specify the 'feed' for free data plans, which is 'iex'
-        params = {'feed': 'iex'}
-        
-        response = requests.get(bar_url, headers=HEADERS, params=params)
-        response.raise_for_status() 
-        
-        # Return the close price 'c' of the latest 1-minute bar
-        return float(response.json()["bar"]["c"])
-    except requests.exceptions.HTTPError as e:
-        print(f"Error fetching latest price for {symbol}: {e}")
-        raise # Re-raise the exception to be caught in the webhook
 
 def close_position(symbol):
     """Closes the entire position for a given symbol."""
@@ -108,40 +89,35 @@ def webhook():
             return jsonify({"message": msg}), 200
 
         try:
+            # --- MODIFIED: NOTIONAL ORDER LOGIC ---
             buying_power = get_buying_power()
-            price_to_use = get_latest_price(symbol)
+            notional_value = TRADE_DOLLAR_AMOUNT
             
-            trade_allocation = buying_power * 0.10
-            qty = int(trade_allocation // price_to_use)
-
-            if qty < 1:
-                return jsonify({"error": f"Not enough buying power for one share at ${price_to_use}."}), 400
-
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                msg = f"Ticker '{symbol}' not found or is not tradable on Alpaca. Skipping order."
+            # Safety Check: Ensure trade amount doesn't exceed buying power
+            if notional_value > buying_power:
+                msg = f"Trade amount ${notional_value:.2f} exceeds buying power ${buying_power:.2f}. Skipping."
                 print(msg)
                 return jsonify({"message": msg}), 200
-            else:
-                print(f"Alpaca API Error during calculation: {e.response.text}")
-                return jsonify({"error": f"Alpaca API Error: {e.response.text}"}), 500
-        except Exception as e:
-            print(f"An unexpected error occurred during calculation: {e}")
-            return jsonify({"error": str(e)}), 500
 
-        order_data = {
-            "symbol": symbol,
-            "qty": qty,
-            "side": entry_action,
-            "type": "market",
-            "time_in_force": "day",
-        }
+            # We no longer need to get the price and calculate quantity beforehand.
+            # We will submit a 'notional' order directly.
+            order_data = {
+                "symbol": symbol,
+                "notional": str(notional_value), # Must be a string for the API
+                "side": entry_action,
+                "type": "market",
+                "time_in_force": "day",
+            }
+        
+        except Exception as e:
+            print(f"An unexpected error occurred during order preparation: {e}")
+            return jsonify({"error": str(e)}), 500
 
         try:
             order_response = requests.post(f"{BASE_URL}/v2/orders", json=order_data, headers=HEADERS)
             order_response.raise_for_status()
-            print(f"Entry order ({entry_action}) for {qty} shares of {symbol} placed successfully.")
-            return jsonify({"message": "Entry order placed", "data": order_response.json()}), order_response.status_code
+            print(f"Notional entry order ({entry_action}) for ${notional_value} of {symbol} placed successfully.")
+            return jsonify({"message": "Notional order placed", "data": order_response.json()}), order_response.status_code
         except requests.exceptions.HTTPError as e:
             print(f"Error placing entry order: {e.response.text}")
             return jsonify({"error": f"Failed to place entry order: {e.response.text}"}), e.response.status_code
@@ -151,5 +127,4 @@ def webhook():
 # --- Main Application Runner ---
 
 if __name__ == "__main__":
-    # For production on Render, it will use a WSGI server like Gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
