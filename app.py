@@ -5,11 +5,13 @@ import os
 app = Flask(__name__)
 
 # --- Alpaca API Configuration ---
+# Ensure these environment variables are set in your deployment environment
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
+BASE_URL = "https://paper-api.alpaca.markets" # Use "https://api.alpaca.markets" for live trading
 
 # --- Strategy Configuration ---
+# Set the strategy type (e.g., "long" or "short")
 STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
 
 HEADERS = {
@@ -19,23 +21,26 @@ HEADERS = {
 
 # --- Helper Functions ---
 
-def position_exists(symbol):
-    """Checks if a position exists for a given symbol."""
+def get_position_qty(symbol):
+    """
+    Retrieves the quantity of an open position for a given symbol.
+    Returns 0 if no position exists.
+    """
     try:
         response = requests.get(f"{BASE_URL}/v2/positions/{symbol}", headers=HEADERS)
         response.raise_for_status()
-        return True
+        return int(response.json()["qty"])
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            return False
+            return 0
         else:
             print(f"Error checking position for {symbol}: {e.response.text}")
             raise
 
 def get_buying_power():
     """
-    Retrieves the 'regt_buying_power', which is the reliable figure for
-    both long and short positions.
+    Retrieves the 'regt_buying_power' from the account, which is the reliable
+    figure for calculating trade size.
     """
     account_response = requests.get(f"{BASE_URL}/v2/account", headers=HEADERS)
     account_response.raise_for_status()
@@ -47,26 +52,59 @@ def is_market_open():
     clock_response.raise_for_status()
     return clock_response.json()["is_open"]
 
-def close_position(symbol):
+def close_position(symbol, alert_price_str, market_is_open):
     """
-    Closes the entire position for a given symbol using a market order
-    to ensure a prompt exit.
+    Closes the entire position for a given symbol.
+    - Uses a market order during regular hours for a prompt exit.
+    - Uses a limit order during extended hours to ensure the order can be placed.
     """
-    close_position_url = f"{BASE_URL}/v2/positions/{symbol}"
-    try:
-        # The DELETE endpoint liquidates the position at the market.
-        response = requests.delete(close_position_url, headers=HEADERS)
-        response.raise_for_status()
-        print(f"Close order for {symbol} submitted successfully.")
-        return jsonify({"message": "Close order submitted", "data": response.json()}), response.status_code
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            msg = f"No open position for {symbol} to close."
-            print(msg)
-            return jsonify({"message": msg}), 200
-        else:
+    qty_to_close = get_position_qty(symbol)
+    if qty_to_close == 0:
+        msg = f"No open position for {symbol} to close."
+        print(msg)
+        return jsonify({"message": msg}), 200
+
+    if market_is_open:
+        # During market hours, a market order is fast and reliable.
+        # The DELETE endpoint liquidates the position using a market order.
+        close_position_url = f"{BASE_URL}/v2/positions/{symbol}"
+        try:
+            response = requests.delete(close_position_url, headers=HEADERS)
+            response.raise_for_status()
+            print(f"Market close order for {symbol} submitted successfully.")
+            return jsonify({"message": "Market close order submitted", "data": response.json()}), response.status_code
+        except requests.exceptions.HTTPError as e:
             print(f"Error closing position {symbol}: {e.response.text}")
             return jsonify({"error": f"Failed to close position: {e.response.text}"}), e.response.status_code
+    else:
+        # During extended hours, a market order will likely fail.
+        # We must use a limit order with the 'extended_hours' flag.
+        try:
+            alert_price = float(alert_price_str)
+            
+            # Use the alert price as the limit price for the sell order.
+            limit_price = round(alert_price, 2)
+
+            order_data = {
+                "symbol": symbol,
+                "qty": qty_to_close,
+                "side": "sell",  # Always 'sell' to close a long position
+                "type": "limit",
+                "limit_price": str(limit_price),
+                "time_in_force": "gtc",  # Good 'Til Canceled, so the order persists
+                "extended_hours": True
+            }
+
+            order_response = requests.post(f"{BASE_URL}/v2/orders", json=order_data, headers=HEADERS)
+            order_response.raise_for_status()
+            print(f"Limit close order for {symbol} placed successfully for extended hours.")
+            return jsonify({"message": "Limit close order submitted", "data": order_response.json()}), order_response.status_code
+        except (ValueError, TypeError):
+            return jsonify({"error": f"Invalid price format received for closing order: {alert_price_str}"}), 400
+        except requests.exceptions.HTTPError as e:
+            print(f"Error placing limit close order: {e.response.text}")
+            return jsonify({"error": f"Failed to place limit close order: {e.response.text}"}), e.response.status_code
+
 
 # --- Webhook Endpoint ---
 
@@ -87,15 +125,19 @@ def webhook():
 
     if not all([symbol, action, alert_price_str]):
         return jsonify({"error": "Invalid payload, missing ticker, action, or price"}), 400
+    
+    # Check market status once for the whole request
+    market_is_open = is_market_open()
 
     entry_action = "buy" if STRATEGY_TYPE == "long" else "sell"
     exit_action = "sell" if STRATEGY_TYPE == "long" else "buy"
 
     if action == exit_action:
-        return close_position(symbol)
+        # Call the updated close_position function with the market status and alert price
+        return close_position(symbol, alert_price_str, market_is_open)
 
     elif action == entry_action:
-        if position_exists(symbol):
+        if get_position_qty(symbol) > 0:
             msg = f"Position already exists for {symbol}, skipping new entry order."
             print(msg)
             return jsonify({"message": msg}), 200
@@ -117,8 +159,6 @@ def webhook():
                 return jsonify({"message": msg}), 200
 
             # --- 2. Determine Order Type (Market vs. Limit) ---
-            market_is_open = is_market_open()
-            
             order_data = {
                 "symbol": symbol,
                 "qty": qty,
@@ -131,9 +171,9 @@ def webhook():
                 order_data["type"] = "market"
             else:
                 print("Market is closed. Placing a LIMIT order for extended hours.")
-                # Set a slightly favorable limit price (0.1% buffer)
+                # For a buy, set a slightly favorable limit price (0.1% buffer)
                 buffer = alert_price * 0.001
-                limit_price = round(alert_price + buffer, 2) if entry_action == "buy" else round(alert_price - buffer, 2)
+                limit_price = round(alert_price + buffer, 2)
                 
                 order_data["type"] = "limit"
                 order_data["limit_price"] = str(limit_price)
@@ -161,3 +201,4 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
