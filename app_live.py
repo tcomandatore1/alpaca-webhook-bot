@@ -180,7 +180,7 @@ def webhook():
                 "symbol": symbol,
                 "qty": qty,
                 "side": entry_action,
-                "time_in_force": "day",
+                "time_in_force": "day", # Changed to "day" for entry orders during extended hours
             }
 
             if market_is_open:
@@ -195,9 +195,7 @@ def webhook():
                 order_data["type"] = "limit"
                 order_data["limit_price"] = str(limit_price)
                 order_data["extended_hours"] = True
-                # For extended hours, 'day' time_in_force might not be ideal.
-                # Using 'gtc' (Good 'Til Canceled) ensures the order persists.
-                order_data["time_in_force"] = "gtc"  
+                # The time_in_force is already set to "day" above for extended hours entry orders.
 
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received: {alert_price_str}"}), 400
