@@ -52,7 +52,7 @@ def is_market_open():
     clock_response.raise_for_status()
     return clock_response.json()["is_open"]
 
-def close_position(symbol, alert_price_str, market_is_open):
+def close_position(symbol, alert_price_str, market_is_open, strategy_type):
     """
     Closes the entire position for a given symbol.
     - Uses a market order during regular hours for a prompt exit.
@@ -82,22 +82,28 @@ def close_position(symbol, alert_price_str, market_is_open):
         try:
             alert_price = float(alert_price_str)
             
-            # Use the alert price as the limit price for the sell order.
+            # The side for closing depends on the strategy type
+            # If long, exit_action is 'sell'. If short, exit_action is 'buy'.
+            exit_side = "sell" if strategy_type == "long" else "buy"
+
+            # Use the alert price as the limit price for the order.
+            # For a sell limit, you want to sell at or above this price.
+            # For a buy limit (to cover short), you want to buy at or below this price.
             limit_price = round(alert_price, 2)
 
             order_data = {
                 "symbol": symbol,
                 "qty": qty_to_close,
-                "side": "sell",  # Always 'sell' to close a long position
+                "side": exit_side,  # Dynamically set 'buy' or 'sell' to close position
                 "type": "limit",
                 "limit_price": str(limit_price),
-                "time_in_force": "gtc",  # Good 'Til Canceled, so the order persists
+                "time_in_force": "gtc",  # Good 'Til Canceled, so the order persists until filled or cancelled
                 "extended_hours": True
             }
 
             order_response = requests.post(f"{BASE_URL}/v2/orders", json=order_data, headers=HEADERS)
             order_response.raise_for_status()
-            print(f"Limit close order for {symbol} placed successfully for extended hours.")
+            print(f"Limit close order ({exit_side}) for {symbol} placed successfully for extended hours.")
             return jsonify({"message": "Limit close order submitted", "data": order_response.json()}), order_response.status_code
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received for closing order: {alert_price_str}"}), 400
@@ -134,7 +140,8 @@ def webhook():
 
     if action == exit_action:
         # Call the updated close_position function with the market status and alert price
-        return close_position(symbol, alert_price_str, market_is_open)
+        # Pass STRATEGY_TYPE to close_position to determine the correct exit side ('buy' for short, 'sell' for long)
+        return close_position(symbol, alert_price_str, market_is_open, STRATEGY_TYPE)
 
     elif action == entry_action:
         if get_position_qty(symbol) > 0:
@@ -171,13 +178,16 @@ def webhook():
                 order_data["type"] = "market"
             else:
                 print("Market is closed. Placing a LIMIT order for extended hours.")
-                # For a buy, set a slightly favorable limit price (0.1% buffer)
-                buffer = alert_price * 0.001
-                limit_price = round(alert_price + buffer, 2)
+                # For both buy and sell limit orders, use the alert price directly.
+                # This ensures the order attempts to fill at the price the alert was triggered.
+                limit_price = round(alert_price, 2)
                 
                 order_data["type"] = "limit"
                 order_data["limit_price"] = str(limit_price)
                 order_data["extended_hours"] = True
+                # For extended hours, 'day' time_in_force might not be ideal.
+                # Using 'gtc' (Good 'Til Canceled) ensures the order persists.
+                order_data["time_in_force"] = "gtc" 
 
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received: {alert_price_str}"}), 400
