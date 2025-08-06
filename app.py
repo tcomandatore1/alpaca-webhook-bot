@@ -8,7 +8,13 @@ app = Flask(__name__)
 # Ensure these environment variables are set in your deployment environment
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets" # Use "https://api.alpaca.markets" for live trading
+BASE_URL = "https://paper-api.alpaca.markets" # This is the paper trading endpoint
+
+# --- Trading Kill Switch ---
+# Set to True to enable trading, False to disable all order submissions.
+# For paper trading, it's often safer to keep this as False by default
+# unless you are actively testing and want orders to go through.
+ENABLE_TRADING = True # Set to False for no trades to go through (safe for testing)
 
 # --- Strategy Configuration ---
 # Set the strategy type (e.g., "long" or "short")
@@ -132,6 +138,12 @@ def webhook():
     if not all([symbol, action, alert_price_str]):
         return jsonify({"error": "Invalid payload, missing ticker, action, or price"}), 400
     
+    # Check the ENABLE_TRADING flag
+    if not ENABLE_TRADING:
+        msg = f"Trading is currently disabled. No order submitted for {symbol}."
+        print(msg)
+        return jsonify({"message": msg}), 200
+        
     # Check market status once for the whole request
     market_is_open = is_market_open()
 
@@ -170,7 +182,7 @@ def webhook():
                 "symbol": symbol,
                 "qty": qty,
                 "side": entry_action,
-                "time_in_force": "day",
+                "time_in_force": "day", # Changed to "day" for entry orders during extended hours
             }
 
             if market_is_open:
@@ -185,9 +197,7 @@ def webhook():
                 order_data["type"] = "limit"
                 order_data["limit_price"] = str(limit_price)
                 order_data["extended_hours"] = True
-                # For extended hours, 'day' time_in_force might not be ideal.
-                # Using 'gtc' (Good 'Til Canceled) ensures the order persists.
-                order_data["time_in_force"] = "gtc" 
+                # The time_in_force is already set to "day" above for extended hours entry orders.
 
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received: {alert_price_str}"}), 400
@@ -211,4 +221,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
