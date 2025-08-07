@@ -16,6 +16,7 @@ BASE_URL = "https://paper-api.alpaca.markets" # This is the paper trading endpoi
 # unless you are actively testing and want orders to go through.
 ENABLE_TRADING = True 
 
+
 # --- Strategy Configuration ---
 # Set the strategy type (e.g., "long" or "short")
 STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
@@ -186,26 +187,30 @@ def webhook():
                 return jsonify({"message": msg}), 200
 
             # --- 2. Determine Order Type (Market vs. Limit) ---
-            # Initialize order_data with common fields
-            order_data = {
-                "symbol": symbol,
-                "qty": qty,
-                "side": entry_action,
-            }
+            # Create a dictionary for the order data
+            order_data = {}
             
             if market_is_open:
                 print("Market is open. Placing a MARKET order.")
-                order_data["type"] = "market"
-                # A key difference: 'time_in_force' is not a valid parameter for market orders.
+                order_data = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "side": entry_action,
+                    "type": "market"
+                }
             else:
                 print("Market is closed. Placing a LIMIT order for extended hours.")
-                # For both buy and sell limit orders, use the alert price directly.
                 limit_price = round(alert_price, 2)
                 
-                order_data["type"] = "limit"
-                order_data["limit_price"] = str(limit_price)
-                order_data["extended_hours"] = True
-                order_data["time_in_force"] = "day" # This is required for extended-hours limit orders
+                order_data = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "side": entry_action,
+                    "type": "limit",
+                    "limit_price": str(limit_price),
+                    "extended_hours": True,
+                    "time_in_force": "day"
+                }
 
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received: {alert_price_str}"}), 400
