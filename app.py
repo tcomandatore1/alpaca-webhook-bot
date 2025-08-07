@@ -10,11 +10,15 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets" # This is the paper trading endpoint
 
-# --- Trading Kill Switch ---
-# Set to True to enable trading, False to disable all order submissions.
-# For paper trading, it's often safer to keep this as False by default
-# unless you are actively testing and want orders to go through.
-ENABLE_TRADING = True 
+
+HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
+}
+
+# --- Settings ---
+ENABLE_TRADING = True
+STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
 
 
 # --- Helper Functions ---
