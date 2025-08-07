@@ -102,7 +102,7 @@ def close_position(symbol, alert_price_str, market_is_open, strategy_type):
                 "side": exit_side,  # Dynamically set 'buy' or 'sell' to close position
                 "type": "limit",
                 "limit_price": str(limit_price),
-                "time_in_force": "gtc",  # Good 'Til Canceled, so the order persists until filled or cancelled
+                "time_in_force": "day",  # Good 'Til Canceled, so the order persists until filled or cancelled
                 "extended_hours": True
             }
 
@@ -198,7 +198,7 @@ def webhook():
                 order_data["extended_hours"] = True
                 # For extended hours, 'day' time_in_force might not be ideal.
                 # Using 'gtc' (Good 'Til Canceled) ensures the order persists.
-                order_data["time_in_force"] = "gtc"  
+                order_data["time_in_force"] = "day"  
 
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received: {alert_price_str}"}), 400
