@@ -187,11 +187,12 @@ def webhook():
                 return jsonify({"message": msg}), 200
 
             # --- 2. Determine Order Type (Market vs. Limit) ---
-            # Create a dictionary for the order data
-            order_data = {}
             
+            # The key fix is here: we create a brand new dictionary for each order type
+            # to ensure no invalid parameters are included.
             if market_is_open:
                 print("Market is open. Placing a MARKET order.")
+                # Build the market order data with only the required parameters
                 order_data = {
                     "symbol": symbol,
                     "qty": qty,
@@ -202,6 +203,7 @@ def webhook():
                 print("Market is closed. Placing a LIMIT order for extended hours.")
                 limit_price = round(alert_price, 2)
                 
+                # Build the limit order data with the required parameters, including time_in_force
                 order_data = {
                     "symbol": symbol,
                     "qty": qty,
