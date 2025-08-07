@@ -108,7 +108,7 @@ def close_position(symbol, alert_price_str, market_is_open, strategy_type):
                 "side": exit_side,  # Dynamically set 'buy' or 'sell' to close position
                 "type": "limit",
                 "limit_price": str(limit_price),
-                "time_in_force": "day",  # This is the fix for the "extended hours" error
+                "time_in_force": "day",  # This is required for extended-hours limit orders
                 "extended_hours": True
             }
 
@@ -192,11 +192,11 @@ def webhook():
                 "qty": qty,
                 "side": entry_action,
             }
-
+            
             if market_is_open:
                 print("Market is open. Placing a MARKET order.")
                 order_data["type"] = "market"
-                # For a market order, time_in_force is not a valid parameter.
+                # A key difference: 'time_in_force' is not a valid parameter for market orders.
             else:
                 print("Market is closed. Placing a LIMIT order for extended hours.")
                 # For both buy and sell limit orders, use the alert price directly.
