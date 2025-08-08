@@ -28,7 +28,7 @@ HEADERS = {
 def get_position_qty(symbol):
     """
     Retrieves the quantity of an open position for a given symbol.
-    Returns 0 if no position exists. Returns a negative number for short positions.
+    Returns 0 if no position exists.
     """
     try:
         response = requests.get(f"{BASE_URL}/v2/positions/{symbol}", headers=HEADERS)
@@ -63,12 +63,7 @@ def close_position(symbol, alert_price_str, market_is_open, strategy_type):
     - Uses a limit order during extended hours to ensure the order can be placed.
     """
     qty_to_close = get_position_qty(symbol)
-    
-    # Alpaca's API requires a positive quantity for the order.
-    # We use the absolute value to handle short positions (which have negative qty).
-    order_qty = abs(qty_to_close)
-    
-    if order_qty == 0:
+    if qty_to_close == 0:
         msg = f"No open position for {symbol} to close."
         print(msg)
         return jsonify({"message": msg}), 200
@@ -102,11 +97,11 @@ def close_position(symbol, alert_price_str, market_is_open, strategy_type):
 
             order_data = {
                 "symbol": symbol,
-                "qty": order_qty,  # Use the absolute value of the quantity
+                "qty": qty_to_close,
                 "side": exit_side,  # Dynamically set 'buy' or 'sell' to close position
                 "type": "limit",
                 "limit_price": str(limit_price),
-                "time_in_force": "day",  # This is the fix for the "extended hours" error
+                "time_in_force": "day",  # Good 'Til Canceled, so the order persists until filled or cancelled
                 "extended_hours": True
             }
 
@@ -159,9 +154,6 @@ def webhook():
         return close_position(symbol, alert_price_str, market_is_open, STRATEGY_TYPE)
 
     elif action == entry_action:
-        # NOTE: This check allows a new order to be placed if you are switching
-        # from a short position to a long position, as get_position_qty()
-        # will return a negative number.
         if get_position_qty(symbol) > 0:
             msg = f"Position already exists for {symbol}, skipping new entry order."
             print(msg)
@@ -188,12 +180,12 @@ def webhook():
                 "symbol": symbol,
                 "qty": qty,
                 "side": entry_action,
+                "time_in_force": "day",
             }
 
             if market_is_open:
                 print("Market is open. Placing a MARKET order.")
                 order_data["type"] = "market"
-                # Alpaca does not support time_in_force for market orders
             else:
                 print("Market is closed. Placing a LIMIT order for extended hours.")
                 # For both buy and sell limit orders, use the alert price directly.
@@ -203,7 +195,9 @@ def webhook():
                 order_data["type"] = "limit"
                 order_data["limit_price"] = str(limit_price)
                 order_data["extended_hours"] = True
-                order_data["time_in_force"] = "day" # This is the fix for the "extended hours" entry order error
+                # For extended hours, 'day' time_in_force might not be ideal.
+                # Using 'gtc' (Good 'Til Canceled) ensures the order persists.
+                order_data["time_in_force"] = "day"  
 
         except (ValueError, TypeError):
             return jsonify({"error": f"Invalid price format received: {alert_price_str}"}), 400
