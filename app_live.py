@@ -1,8 +1,12 @@
-from flask import Flask, request, jsonify
-import requests
 import os
+import requests
 from datetime import datetime, time
-import pytz
+try:
+    import pytz
+except ImportError as e:
+    print(f"Error importing pytz: {e}")
+    raise
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -14,7 +18,7 @@ BASE_URL = "https://api.alpaca.markets" # Changed to LIVE trading endpoint
 
 # --- Trading Kill Switch ---
 # Set to True to enable live trading, False to disable all order submissions.
-ENABLE_TRADING = True # Set to True for trading, False for no trades to go through
+ENABLE_TRADING = False # Set to True for trading, False for no trades to go through
 
 # --- Strategy Configuration ---
 # Set the strategy type (e.g., "long" or "short")
