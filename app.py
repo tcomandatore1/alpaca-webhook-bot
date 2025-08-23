@@ -1,6 +1,12 @@
-from flask import Flask, request, jsonify
-import requests
 import os
+import requests
+from datetime import datetime, time
+try:
+    import pytz
+except ImportError as e:
+    print(f"Error importing pytz: {e}")
+    raise
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -10,7 +16,6 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 BASE_URL = "https://paper-api.alpaca.markets" # This is the paper trading endpoint
 
-
 # --- Trading Kill Switch ---
 # Set to True to enable live trading, False to disable all order submissions.
 ENABLE_TRADING = True # Set to True for trading, False for no trades to go through
@@ -18,6 +23,12 @@ ENABLE_TRADING = True # Set to True for trading, False for no trades to go throu
 # --- Strategy Configuration ---
 # Set the strategy type (e.g., "long" or "short")
 STRATEGY_TYPE = os.environ.get("STRATEGY_TYPE", "long").lower()
+
+# --- Market Hours Configuration ---
+# Enable market hours restrictions (True to enforce market hours, False to allow all hours)
+ENFORCE_MARKET_HOURS = True
+# Minutes before market close to automatically close all positions (default: 5 minutes)
+AUTO_CLOSE_BEFORE_MINUTES = 5
 
 HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
@@ -56,6 +67,107 @@ def is_market_open():
     clock_response = requests.get(f"{BASE_URL}/v2/clock", headers=HEADERS)
     clock_response.raise_for_status()
     return clock_response.json()["is_open"]
+
+def get_current_et_time():
+    """Get current time in Eastern Time"""
+    et_tz = pytz.timezone('US/Eastern')
+    return datetime.now(et_tz)
+
+def is_within_trading_hours():
+    """
+    Check if current time is within allowed trading hours:
+    - Pre-market: 4:00 AM - 9:30 AM ET
+    - Regular market: 9:30 AM - 4:00 PM ET
+    Returns True if within trading hours, False otherwise.
+    """
+    if not ENFORCE_MARKET_HOURS:
+        return True
+    
+    current_et = get_current_et_time()
+    current_time = current_et.time()
+    current_weekday = current_et.weekday()  # 0=Monday, 6=Sunday
+    
+    # Only trade on weekdays (Monday=0 to Friday=4)
+    if current_weekday > 4:  # Weekend
+        return False
+    
+    # Define trading hours
+    pre_market_start = time(4, 0)    # 4:00 AM ET
+    regular_start = time(9, 30)      # 9:30 AM ET  
+    regular_end = time(16, 0)        # 4:00 PM ET
+    
+    # Check if within pre-market (4:00 AM - 9:30 AM ET)
+    if pre_market_start <= current_time < regular_start:
+        return True
+    
+    # Check if within regular market hours (9:30 AM - 4:00 PM ET)
+    if regular_start <= current_time < regular_end:
+        return True
+    
+    return False
+
+def is_near_market_close():
+    """
+    Check if we're within AUTO_CLOSE_BEFORE_MINUTES of market close (4:00 PM ET)
+    """
+    if not ENFORCE_MARKET_HOURS:
+        return False
+    
+    current_et = get_current_et_time()
+    current_time = current_et.time()
+    current_weekday = current_et.weekday()
+    
+    # Only check on weekdays
+    if current_weekday > 4:
+        return False
+    
+    # Market closes at 4:00 PM ET
+    market_close = time(16, 0)
+    # Calculate the time to start closing (e.g., 3:55 PM for 5-minute buffer)
+    close_hour = 15 if AUTO_CLOSE_BEFORE_MINUTES >= 60 else 16
+    close_minute = (60 - AUTO_CLOSE_BEFORE_MINUTES) if AUTO_CLOSE_BEFORE_MINUTES < 60 else (60 - (AUTO_CLOSE_BEFORE_MINUTES - 60))
+    close_buffer_time = time(close_hour, close_minute)
+    
+    # If it's past the buffer time but before market close
+    if close_buffer_time <= current_time < market_close:
+        return True
+    
+    return False
+
+def get_all_positions():
+    """Get all open positions"""
+    try:
+        response = requests.get(f"{BASE_URL}/v2/positions", headers=HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        print(f"Error fetching positions: {e.response.text}")
+        return []
+
+def close_all_positions():
+    """Close all open positions before market close"""
+    positions = get_all_positions()
+    
+    if not positions:
+        print("No open positions to close.")
+        return True
+    
+    print(f"AUTO-CLOSE: Closing {len(positions)} positions before market close")
+    
+    success_count = 0
+    for position in positions:
+        try:
+            symbol = position['symbol']
+            # Use market order to close quickly
+            close_url = f"{BASE_URL}/v2/positions/{symbol}"
+            response = requests.delete(close_url, headers=HEADERS)
+            response.raise_for_status()
+            print(f"AUTO-CLOSE: Closed position for {symbol}")
+            success_count += 1
+        except Exception as e:
+            print(f"AUTO-CLOSE ERROR: Failed to close {symbol}: {e}")
+    
+    return success_count == len(positions)
 
 def close_position(symbol, alert_price_str, market_is_open, strategy_type):
     """
@@ -126,6 +238,7 @@ def webhook():
     - Uses 10% of buying power for trade size.
     - Places MARKET orders during regular hours.
     - Places LIMIT orders during extended hours.
+    - Enforces market hours restrictions if enabled.
     """
     data = request.get_json()
     print(f"Received alert for '{STRATEGY_TYPE}' strategy: {data}")
@@ -142,6 +255,22 @@ def webhook():
         msg = f"Trading is currently disabled. No order submitted for {symbol}."
         print(msg)
         return jsonify({"message": msg}), 200
+    
+    # === MARKET HOURS CHECKS ===
+    
+    # 1. Check if we should auto-close positions before market close
+    if ENFORCE_MARKET_HOURS and is_near_market_close():
+        print("AUTO-CLOSE TRIGGERED: Near market close, closing all positions...")
+        close_success = close_all_positions()
+        msg = f"Auto-close triggered {AUTO_CLOSE_BEFORE_MINUTES} min before market close. Positions {'closed successfully' if close_success else 'closure had errors'}."
+        return jsonify({"message": msg, "auto_close": True}), 200
+    
+    # 2. Check if we're within allowed trading hours
+    if ENFORCE_MARKET_HOURS and not is_within_trading_hours():
+        current_et = get_current_et_time()
+        msg = f"BLOCKED: Trading outside allowed hours. Current time: {current_et.strftime('%I:%M %p ET')}. Allowed: 4:00 AM - 4:00 PM ET (weekdays)."
+        print(msg)
+        return jsonify({"message": msg, "blocked_time": current_et.isoformat()}), 200
         
     # Check market status once for the whole request
     market_is_open = is_market_open()
@@ -217,6 +346,62 @@ def webhook():
             return jsonify({"error": f"Failed to place entry order: {e.response.text}"}), e.response.status_code
 
     return jsonify({"message": f"Action '{action}' does not match expected actions for '{STRATEGY_TYPE}' strategy."}), 200
+
+# --- Status Endpoint ---
+
+@app.route("/status", methods=["GET"])
+def status():
+    """
+    Returns current market hours status and trading configuration
+    """
+    current_et = get_current_et_time()
+    within_hours = is_within_trading_hours()
+    near_close = is_near_market_close()
+    market_open = is_market_open()
+    
+    # Get position count
+    positions = get_all_positions()
+    position_count = len(positions)
+    
+    status_info = {
+        "current_time": {
+            "eastern": current_et.strftime("%Y-%m-%d %I:%M:%S %p ET"),
+            "iso": current_et.isoformat(),
+            "weekday": current_et.strftime("%A")
+        },
+        "market_status": {
+            "alpaca_market_open": market_open,
+            "within_trading_hours": within_hours,
+            "near_market_close": near_close,
+            "trading_allowed": within_hours and not near_close
+        },
+        "configuration": {
+            "enforce_market_hours": ENFORCE_MARKET_HOURS,
+            "auto_close_before_minutes": AUTO_CLOSE_BEFORE_MINUTES,
+            "enable_trading": ENABLE_TRADING,
+            "strategy_type": STRATEGY_TYPE
+        },
+        "trading_hours": {
+            "pre_market": "4:00 AM - 9:30 AM ET",
+            "regular_market": "9:30 AM - 4:00 PM ET", 
+            "after_hours": "BLOCKED (4:00 PM - 4:00 AM ET next day)"
+        },
+        "positions": {
+            "count": position_count,
+            "symbols": [pos["symbol"] for pos in positions] if positions else []
+        }
+    }
+    
+    # Add timezone conversion for Pacific Time users
+    pt_tz = pytz.timezone('US/Pacific')
+    current_pt = current_et.astimezone(pt_tz)
+    status_info["current_time"]["pacific"] = current_pt.strftime("%Y-%m-%d %I:%M:%S %p PT")
+    status_info["trading_hours"]["pacific_equivalent"] = {
+        "pre_market": "1:00 AM - 6:30 AM PT",
+        "regular_market": "6:30 AM - 1:00 PM PT"
+    }
+    
+    return jsonify(status_info), 200
 
 # --- Main Application Runner ---
 
