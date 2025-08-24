@@ -15,7 +15,7 @@ from alpaca.trading.stream import TradingStream
 # Environment / Clients
 # =========================
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
-ALPACA_API_SECRET = os.environ["ALPACA_API_SECRET"]
+ALPACA_API_SECRET = os.environ["ALPACA_SECRET_KEY"] 
 ALPACA_PAPER      = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 trading = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
