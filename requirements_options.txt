@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 alpaca-py
 python-dotenv
+gunicorn
