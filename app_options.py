@@ -19,6 +19,10 @@ ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_API_SECRET = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_PAPER      = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
+# Market data bases
+DATA_STOCKS_BASE = "https://data.alpaca.markets/v2"   # stocks quotes/trades/bars
+ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")         # "iex" (default) or "sip" if you have it
+
 # Trading client + trade updates stream
 trading = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
 stream  = TradingStream(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
@@ -79,19 +83,46 @@ class SimpleTrade(BaseModel):
 # =========================
 async def get_underlying_price(underlying: str) -> float:
     """
-    Fetch latest quote for the underlying (ask price preferred for conservative entries).
+    Fetch latest underlying price from Alpaca market data.
+    Prefer latest quote ask; fall back to latest trade or bar if needed.
     """
-    url = f"{ALPACA_REST_BASE}/v2/stocks/{underlying.upper()}/quotes/latest"
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=HEADERS)
-        r.raise_for_status()
-        q = r.json().get("quote") or {}
-    ap = q.get("ap")  # ask price
-    if ap is None:
-        ap = q.get("bp")  # bid as fallback
-    if ap is None:
-        raise HTTPException(status_code=502, detail="No quote available for underlying.")
-    return float(ap)
+        # Try latest QUOTE first
+        try:
+            q_url = f"{DATA_STOCKS_BASE}/stocks/{underlying.upper()}/quotes/latest"
+            qr = await client.get(q_url, headers=HEADERS, params={"feed": ALPACA_FEED})
+            if qr.status_code == 200:
+                q = qr.json().get("quote") or {}
+                ap = q.get("ap") or q.get("bp")
+                if ap is not None:
+                    return float(ap)
+        except Exception:
+            pass
+
+        # Fall back to latest TRADE
+        try:
+            t_url = f"{DATA_STOCKS_BASE}/stocks/{underlying.upper()}/trades/latest"
+            tr = await client.get(t_url, headers=HEADERS, params={"feed": ALPACA_FEED})
+            if tr.status_code == 200:
+                px = (tr.json().get("trade") or {}).get("p")
+                if px is not None:
+                    return float(px)
+        except Exception:
+            pass
+
+        # Fall back to latest BAR (close)
+        try:
+            b_url = f"{DATA_STOCKS_BASE}/stocks/{underlying.upper()}/bars/latest"
+            br = await client.get(b_url, headers=HEADERS, params={"feed": ALPACA_FEED})
+            if br.status_code == 200:
+                c = (br.json().get("bar") or {}).get("c")
+                if c is not None:
+                    return float(c)
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=502, detail="Unable to fetch underlying price from market data.")
+
 
 async def choose_contract_symbol(underlying: str, expiry: Optional[str], is_call: bool,
                                  strike: Optional[float], _target_delta_unused: float) -> str:
@@ -387,3 +418,12 @@ async def trade_simple(req: SimpleTrade):
         tp_pct=req.tp_pct, sl_pct=req.sl_pct
     )
     return await trade(full)
+
+@app.post("/dry_run_pick")
+async def dry_run_pick(req: SimpleTrade):
+    sig = req.signal.lower().strip()
+    is_call = sig == "long"
+    sym = await choose_contract_symbol(
+        underlying=req.underlying, expiry=None, is_call=is_call, strike=None, _target_delta_unused=0.5
+    )
+    return {"ok": True, "chosen_contract": sym}
