@@ -14,19 +14,27 @@ from alpaca.trading.stream import TradingStream
 # =========================
 # Environment / Clients
 # =========================
+# NOTE: keep the env var names you’re already using on Render
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
-ALPACA_API_SECRET = os.environ["ALPACA_SECRET_KEY"] 
+ALPACA_API_SECRET = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_PAPER      = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
+# Trading client + trade updates stream
 trading = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
 stream  = TradingStream(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
 
-DATA_BASE = "https://data.alpaca.markets/v1beta1/options"
-HEADERS   = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_API_SECRET}
+# REST base for quotes & contract lookup (paper)
+ALPACA_REST_BASE = "https://paper-api.alpaca.markets"
 
-# Auto-flatten config (your request: 13:00 PT)
+# Shared auth headers for REST calls
+HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_API_SECRET
+}
+
+# Auto-flatten config (LOCAL time is America/Los_Angeles)
 LOCAL_TZ  = ZoneInfo("America/Los_Angeles")
-EOD_HHMM  = os.getenv("EOD_FLATTEN_HHMM", "13:00")
+EOD_HHMM  = os.getenv("EOD_FLATTEN_HHMM", "13:00")  # 13:00 PT by default
 EOD_ON    = os.getenv("EOD_ENABLED", "true").lower() == "true"
 
 # Track OCO children: parent entry id -> {tp_id, sl_id}
@@ -35,29 +43,31 @@ STREAM_RUNNING = False
 EOD_THREAD_STARTED = False
 _eod_last_run_date = None
 
-app = FastAPI(title="VWAP Options Trader", version="1.3")
+app = FastAPI(title="VWAP Options Trader", version="1.4")
 
 # =========================
 # Models
 # =========================
 class TradeRequest(BaseModel):
     underlying: str = Field(..., examples=["SPY", "QQQ"])
-    side: Literal["long_call", "long_put"] = "long_call"   # required in this endpoint
+    side: Literal["long_call", "long_put"] = "long_call"   # long_call=buy call; long_put=buy put
     expiry: Optional[str] = None                           # YYYY-MM-DD; if None -> nearest >= today
-    strike: Optional[float] = None                         # if None -> choose by target_delta
+    strike: Optional[float] = None                         # if None -> ATM (closest to spot)
+    # target_delta retained for compatibility; ignored by ATM selector
     target_delta: float = Field(0.50, ge=0.05, le=0.95)
     contracts: int = Field(1, ge=1)
     order_type: Literal["market", "limit"] = "market"
     limit_price: Optional[float] = None
-    tp_pct: float = Field(0.35, gt=0)                      # default +35%
-    sl_pct: float = Field(0.50, gt=0)                      # default -50%
+    tp_pct: float = Field(0.35, gt=0)                      # +35% default
+    sl_pct: float = Field(0.50, gt=0)                      # -50% default
     client_tag: Optional[str] = None
 
 class SimpleTrade(BaseModel):
     # Minimal payload for TradingView alerts that only send the underlying + signal
     underlying: str
-    signal: Literal["long", "short"]                       # long -> long_call, short -> long_put
+    signal: Literal["long", "short"]                       # long -> buy call, short -> buy put
     contracts: int = 1
+    # target_delta retained for backwards-compat; ignored by ATM logic
     target_delta: float = 0.50
     tp_pct: float = 0.35
     sl_pct: float = 0.50
@@ -65,68 +75,79 @@ class SimpleTrade(BaseModel):
     limit_price: Optional[float] = None
 
 # =========================
-# Helpers
+# Helpers (ATM selection + OCO exits)
 # =========================
-async def list_expirations(underlying: str) -> List[str]:
-    url = f"{DATA_BASE}/snapshots/{underlying.upper()}"
+async def get_underlying_price(underlying: str) -> float:
+    """
+    Fetch latest quote for the underlying (ask price preferred for conservative entries).
+    """
+    url = f"{ALPACA_REST_BASE}/v2/stocks/{underlying.upper()}/quotes/latest"
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=HEADERS, params={"feed": "indicative"})
+        r = await client.get(url, headers=HEADERS)
         r.raise_for_status()
-        data = r.json()
-    exps = []
-    for snap in data.get("snapshots", []):
-        c = snap.get("contract") or {}
-        if c.get("expiration_date"):
-            exps.append(c["expiration_date"])
-    return sorted(set(exps))
-
-def nearest_exp_on_or_after(today_iso: str, exps: List[str]) -> Optional[str]:
-    t = datetime.fromisoformat(today_iso).date()
-    cands = sorted(d for d in exps if datetime.fromisoformat(d).date() >= t)
-    return cands[0] if cands else None
+        q = r.json().get("quote") or {}
+    ap = q.get("ap")  # ask price
+    if ap is None:
+        ap = q.get("bp")  # bid as fallback
+    if ap is None:
+        raise HTTPException(status_code=502, detail="No quote available for underlying.")
+    return float(ap)
 
 async def choose_contract_symbol(underlying: str, expiry: Optional[str], is_call: bool,
-                                 strike: Optional[float], target_delta: float) -> str:
-    if expiry is None:
-        exps = await list_expirations(underlying)
-        expiry = nearest_exp_on_or_after(date.today().isoformat(), exps)
-        if not expiry:
-            raise HTTPException(status_code=404, detail="No valid expirations found ≥ today")
-
-    url = f"{DATA_BASE}/snapshots/{underlying.upper()}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=HEADERS, params={"feed": "indicative"})
+                                 strike: Optional[float], _target_delta_unused: float) -> str:
+    """
+    ATM selection:
+      1) Pull contracts via /v2/options/contracts?underlying_symbols=<UND>
+      2) Choose nearest expiration date >= today (or the provided expiry)
+      3) Filter by type (call/put)
+      4) If 'strike' provided, pick exact strike; otherwise pick ATM (closest strike to current ask)
+    """
+    # 1) Pull contracts
+    url = f"{ALPACA_REST_BASE}/v2/options/contracts"
+    params = {
+        "underlying_symbols": underlying.upper(),
+        "limit": 1000
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=HEADERS, params=params)
         r.raise_for_status()
         data = r.json()
 
-    best = None  # (score, symbol)
-    for snap in data.get("snapshots", []):
-        sym      = snap.get("symbol")
-        contract = snap.get("contract") or {}
-        greeks   = snap.get("greeks") or {}
-        if not sym or not contract:
-            continue
-        if contract.get("expiration_date") != expiry:
-            continue
-        if (contract.get("type") == "call") != is_call:
-            continue
+    contracts = data.get("option_contracts", [])
+    if not contracts:
+        raise HTTPException(status_code=404, detail="No option contracts returned for underlying.")
 
-        if strike is not None:
-            if abs(float(contract.get("strike_price", 0)) - float(strike)) < 1e-6:
-                return sym
-            else:
-                continue
+    # 2) Choose expiration
+    today = date.today()
+    # keep only expiries >= today
+    contracts = [c for c in contracts if date.fromisoformat(c["expiration_date"]) >= today]
 
-        d = greeks.get("delta")
-        if d is None:
-            continue
-        score = abs(abs(float(d)) - target_delta)
-        if best is None or score < best[0]:
-            best = (score, sym)
+    if expiry:
+        expiry_contracts = [c for c in contracts if c["expiration_date"] == expiry]
+        if not expiry_contracts:
+            raise HTTPException(status_code=404, detail=f"No contracts for requested expiry {expiry}.")
+    else:
+        contracts.sort(key=lambda c: c["expiration_date"])
+        nearest_exp = contracts[0]["expiration_date"]
+        expiry_contracts = [c for c in contracts if c["expiration_date"] == nearest_exp]
 
-    if not best:
-        raise HTTPException(status_code=404, detail="No option matched criteria (expiry/type/delta/strike).")
-    return best[1]
+    # 3) Filter by type
+    typ = "call" if is_call else "put"
+    expiry_contracts = [c for c in expiry_contracts if (c.get("type") == typ)]
+    if not expiry_contracts:
+        raise HTTPException(status_code=404, detail=f"No {typ} contracts at chosen expiry.")
+
+    # 4) Strike selection
+    if strike is not None:
+        for c in expiry_contracts:
+            if abs(float(c["strike_price"]) - float(strike)) < 1e-6:
+                return c["symbol"]
+        raise HTTPException(status_code=404, detail=f"Requested strike {strike} not found at chosen expiry.")
+
+    # ATM = strike closest to spot
+    spot = await get_underlying_price(underlying)
+    expiry_contracts.sort(key=lambda c: abs(float(c["strike_price"]) - spot))
+    return expiry_contracts[0]["symbol"]
 
 async def wait_for_fill(order_id: str, poll_sec: float = 0.5, timeout_sec: float = 90.0) -> float:
     deadline = datetime.now(timezone.utc).timestamp() + timeout_sec
@@ -141,6 +162,12 @@ async def wait_for_fill(order_id: str, poll_sec: float = 0.5, timeout_sec: float
 
 async def place_oco_children(symbol: str, qty: int, entry_avg: float,
                              tp_pct: float, sl_pct: float, parent_id: str):
+    """
+    Simulate OCO exits on the option premium:
+      - TP = entry * (1 + tp_pct)
+      - SL = entry * (1 - sl_pct)
+    Cancel the sibling when one leg fills (handled by trade update stream).
+    """
     tp_px = round(entry_avg * (1 + tp_pct), 2)
     sl_px = round(entry_avg * (1 - sl_pct), 2)
 
@@ -174,6 +201,7 @@ async def on_trade_update(u):
                     elif event in ("canceled", "rejected", "expired", "done_for_day"):
                         OCO_BOOK.pop(parent, None)
     except Exception:
+        # keep stream alive
         pass
 
 def ensure_stream():
@@ -185,7 +213,7 @@ def ensure_stream():
         STREAM_RUNNING = True
 
 # =========================
-# EOD auto-flatten @ 13:00 PT
+# EOD auto-flatten @ LOCAL H:M (PT)
 # =========================
 async def flatten_all_options():
     try:
@@ -242,17 +270,24 @@ def _start():
     ensure_stream()
     ensure_eod_thread()
 
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "VWAP Options Trader up", "see": "/health"}
+
 @app.get("/health")
 def health():
-    return {"ok": True, "paper": ALPACA_PAPER, "oco_tracked": len(OCO_BOOK), "eod_time": EOD_HHMM, "tz": str(LOCAL_TZ)}
+    return {"ok": True, "paper": ALPACA_PAPER, "oco_tracked": len(OCO_BOOK),
+            "eod_time": EOD_HHMM, "tz": str(LOCAL_TZ)}
 
 @app.get("/positions")
 def positions():
     pos = []
     for p in trading.get_all_positions():
         pos.append({
-            "symbol": p.symbol, "asset_class": str(p.asset_class),
-            "qty": p.qty, "avg_entry": p.avg_entry_price
+            "symbol": p.symbol,
+            "asset_class": str(p.asset_class),
+            "qty": p.qty,
+            "avg_entry": p.avg_entry_price
         })
     return {"ok": True, "positions": pos}
 
@@ -260,7 +295,8 @@ def positions():
 def orders():
     open_orders = trading.get_orders(status="open")
     return {"ok": True, "count": len(open_orders),
-            "orders": [{"id": o.id, "symbol": o.symbol, "side": str(o.side), "type": str(o.type), "status": o.status} for o in open_orders]}
+            "orders": [{"id": o.id, "symbol": o.symbol, "side": str(o.side),
+                        "type": str(o.type), "status": o.status} for o in open_orders]}
 
 @app.post("/eod_flatten")
 async def eod_flatten():
@@ -269,11 +305,15 @@ async def eod_flatten():
 
 @app.post("/force_close")
 def force_close(payload: dict):
-    """Idempotent close on alert: pass {"underlying":"SPY"} or {"symbol":"<option OCC>"}."""
+    """
+    Idempotent close on alert:
+      - pass {"underlying":"SPY"}  -> close ALL SPY option positions
+      - or   {"symbol":"<OCC>"}    -> close that specific option
+    """
     symbol: Optional[str] = payload.get("symbol")
     underlying: Optional[str] = payload.get("underlying")
 
-    # Cancel open orders for target
+    # Cancel open orders for that target first
     try:
         for o in trading.get_orders(status="open"):
             if (symbol and o.symbol == symbol) or (underlying and underlying.upper() in o.symbol):
@@ -307,13 +347,13 @@ def force_close(payload: dict):
         return {"ok": True, "note": "No matching option positions found (already flat)."}
     return {"ok": True, "results": flattened}
 
-# ----- Full-featured trade endpoint (side required) -----
+# ----- Full-featured trade endpoint (side required; now uses ATM selection) -----
 @app.post("/trade")
 async def trade(req: TradeRequest):
     is_call = req.side == "long_call"
     symbol  = await choose_contract_symbol(
         underlying=req.underlying, expiry=req.expiry, is_call=is_call,
-        strike=req.strike, target_delta=req.target_delta
+        strike=req.strike, _target_delta_unused=req.target_delta
     )
 
     # Entry
@@ -329,7 +369,7 @@ async def trade(req: TradeRequest):
     entry = trading.submit_order(entry_req)
     avg   = await wait_for_fill(entry.id)
 
-    # OCO exits
+    # OCO exits on the option premium
     await place_oco_children(symbol, req.contracts, avg, req.tp_pct, req.sl_pct, entry.id)
 
     return {"ok": True, "contract": symbol, "entry_id": entry.id,
@@ -338,7 +378,8 @@ async def trade(req: TradeRequest):
 # ----- Simple endpoint for TradingView alerts that only send underlying + signal -----
 @app.post("/trade_simple")
 async def trade_simple(req: SimpleTrade):
-    side = "long_call" if req.signal == "long" else "long_put"
+    sig = req.signal.lower().strip()
+    side = "long_call" if sig == "long" else "long_put"
     full = TradeRequest(
         underlying=req.underlying, side=side, expiry=None, strike=None,
         target_delta=req.target_delta, contracts=req.contracts,
