@@ -55,12 +55,26 @@ def get_position_qty(symbol):
 
 def get_buying_power():
     """
-    Retrieves the 'regt_buying_power' from the account, which is the reliable
-    figure for calculating trade size.
+    Retrieves the total account 'equity' (cash + market value of positions)
+    for calculating 10% allocation based on total account value.
     """
     account_response = requests.get(f"{BASE_URL}/v2/account", headers=HEADERS)
     account_response.raise_for_status()
-    return float(account_response.json()["regt_buying_power"])
+    account_data = account_response.json()
+    
+    total_equity = float(account_data["equity"])
+    available_buying_power = float(account_data["regt_buying_power"])
+    
+    # Calculate 10% of total equity
+    desired_allocation = total_equity * 0.10
+    
+    # Safety check: ensure we don't exceed available buying power
+    if desired_allocation > available_buying_power:
+        print(f"Warning: Desired allocation (${desired_allocation:.2f}) exceeds available buying power (${available_buying_power:.2f})")
+        print(f"Using available buying power instead.")
+        return available_buying_power
+    
+    return desired_allocation
 
 def is_market_open():
     """Checks if the market is currently open."""
@@ -235,7 +249,7 @@ def close_position(symbol, alert_price_str, market_is_open, strategy_type):
 def webhook():
     """
     Receives alerts from TradingView and places orders.
-    - Uses 10% of buying power for trade size.
+    - Uses 10% of total account equity for trade size.
     - Places MARKET orders during regular hours.
     - Places LIMIT orders during extended hours.
     - Enforces market hours restrictions if enabled.
@@ -290,18 +304,18 @@ def webhook():
             return jsonify({"message": msg}), 200
 
         try:
-            # --- 1. Calculate Trade Size (10% of Buying Power) ---
+            # --- 1. Calculate Trade Size (10% of Total Account Equity) ---
             buying_power = get_buying_power()
             alert_price = float(alert_price_str)
             
             if alert_price <= 0:
                 return jsonify({"error": "Invalid price received from alert."}), 400
 
-            trade_allocation = buying_power * 0.10
+            trade_allocation = buying_power  # buying_power now returns 10% of equity
             qty = int(trade_allocation // alert_price)
 
             if qty < 1:
-                msg = f"Not enough buying power for one share at ${alert_price:.2f} with 10% allocation."
+                msg = f"Not enough available funds for one share at ${alert_price:.2f} with 10% equity allocation."
                 print(msg)
                 return jsonify({"message": msg}), 200
 
