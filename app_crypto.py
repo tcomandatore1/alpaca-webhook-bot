@@ -1,5 +1,12 @@
-import os, json, uuid, traceback
+import os, json, uuid, traceback, secrets, time
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+import requests
+import jwt
+from cryptography.hazmat.primitives import serialization
+
+# Load environment variables
+load_dotenv()
 
 # --- CCXT (Coinbase futures via unified symbol) ---
 import ccxt
@@ -58,6 +65,72 @@ def get_exchange():
         raise
         
     return _exchange
+
+def _build_jwt(method: str, path: str) -> str:
+    """Build JWT token for Coinbase API - SAME AS WORKING HFT BOT"""
+    try:
+        # Remove quotes and handle the PEM key properly
+        pem_key = COINBASE_API_SECRET.strip().strip('"')
+        app.logger.debug(f"PEM key starts with: {pem_key[:30]}...")
+        
+        private_key = serialization.load_pem_private_key(pem_key.encode(), password=None)
+        now = int(time.time())
+        payload = {
+            "sub": COINBASE_API_KEY,
+            "iss": "cdp",
+            "nbf": now,
+            "exp": now + 120,
+            "uri": f"{method} api.coinbase.com{path}",
+        }
+        headers = {"kid": COINBASE_API_KEY, "nonce": secrets.token_hex()}
+        token = jwt.encode(payload, private_key, algorithm="ES256", headers=headers)
+        return token
+    except Exception as e:
+        app.logger.error(f"JWT build failed: {e}")
+        app.logger.error(f"API_KEY: {COINBASE_API_KEY[:20]}...")
+        app.logger.error(f"API_SECRET starts: {COINBASE_API_SECRET[:50]}...")
+        raise
+
+def place_market_order_jwt(side: str, contracts: int, client_order_id: str) -> dict:
+    """Place market order using JWT REST API - SAME AS WORKING HFT BOT"""
+    try:
+        # Get product_id from exchange
+        ex = get_exchange()
+        product_id = ex.markets[SYMBOL].get("id")
+        if not product_id:
+            raise RuntimeError(f"Could not get product_id for {SYMBOL}")
+        
+        # Build the order payload exactly like HFT bot
+        base_size = str(int(contracts))
+        oc = {"market_market_ioc": {"base_size": base_size}}
+        payload = {
+            "client_order_id": client_order_id,
+            "product_id": product_id,
+            "side": side.upper(),
+            "order_configuration": oc
+        }
+        
+        # Make the REST API call with JWT
+        path = "/api/v3/brokerage/orders"
+        token = _build_jwt("POST", path)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        app.logger.info(f"🚀 JWT REST API call: POST {path}")
+        app.logger.info(f"Payload: {payload}")
+        
+        r = requests.post(f"https://api.coinbase.com{path}", 
+                         headers=headers, 
+                         data=json.dumps(payload), 
+                         timeout=10)
+        r.raise_for_status()
+        resp = r.json()
+        
+        app.logger.info(f"✅ JWT REST API response: {resp}")
+        return resp
+        
+    except Exception as e:
+        app.logger.error(f"JWT REST API order failed: {e}")
+        raise
 
 @app.get("/health")
 def health():
@@ -160,46 +233,64 @@ def tv():
     if DRY_RUN:
         return jsonify({"ok": True, "dry_run": True, "would_send": sent})
 
-    # Place MARKET order in CONTRACTS (ccxt handles mapping for futures)
+    # Place MARKET order using JWT REST API (SAME AS WORKING HFT BOT)
     try:
-        app.logger.info(f"🚀 Creating order: {side.upper()} {contracts} contracts")
-        ex = get_exchange()
+        app.logger.info(f"🚀 Creating order: {side.upper()} {contracts} contracts using JWT REST API")
         
-        # Log the exact call we're making
-        app.logger.info(f"Calling: ex.create_order('{SYMBOL}', 'market', '{side}', {contracts}, None, {{'clientOrderId': '{client_order_id}'}})")
+        # Use the same method as your working HFT bot
+        order_result = place_market_order_jwt(side, contracts, client_order_id)
         
-        # Some venues accept a client order id via params; ccxt will pass it through if supported.
-        params = {"clientOrderId": client_order_id}
-        
-        # This is where your "index out of range" error is likely happening
-        order = ex.create_order(SYMBOL, "market", side, contracts, None, params)
-        
-        app.logger.info(f"✅ Order created successfully: {order}")
-        return jsonify({"ok": True, "order": order, "sent": sent})
+        app.logger.info(f"✅ Order created successfully via JWT: {order_result}")
+        return jsonify({"ok": True, "order": order_result, "sent": sent, "method": "jwt_rest_api"})
         
     except Exception as e:
-        # Enhanced error logging to pinpoint the issue
-        app.logger.error(f"❌ Order failed: {e}")
+        # Enhanced error logging
+        app.logger.error(f"❌ JWT REST API Order failed: {e}")
         app.logger.error(f"Full traceback: {traceback.format_exc()}")
         
         error_info = {
             "error_type": type(e).__name__,
             "error_message": str(e),
-            "sent_params": sent
+            "sent_params": sent,
+            "method": "jwt_rest_api"
         }
         
-        # Special handling for index out of range
-        if "index out of range" in str(e).lower():
-            app.logger.error("🚨 This is likely a ccxt parsing issue with Coinbase API response")
-            error_info["debug_hint"] = "ccxt may be having trouble parsing Coinbase's API response format"
-            
         # Try to get more error context
         if hasattr(e, 'args'):
             error_info["error_args"] = e.args
             
-        return jsonify({"ok": False, "error": "exchange_error", "details": error_info}), 400
+        return jsonify({"ok": False, "error": "jwt_rest_api_error", "details": error_info}), 400
 
 # Add global error handler
+@app.get("/spottest")
+def spottest():
+    """Test if we can trade spot ETH (not futures) with current permissions"""
+    try:
+        ex = get_exchange()
+        
+        # Test spot ETH symbol instead of futures
+        spot_symbol = "ETH/USD"
+        
+        # Check if spot symbol exists
+        if spot_symbol not in ex.markets:
+            return {"ok": False, "error": f"Spot symbol {spot_symbol} not found"}
+        
+        # Try a small spot order (this will fail but show different error if permissions work)
+        try:
+            # This should fail with different error if permissions are OK
+            order = ex.create_order(spot_symbol, "market", "buy", 0.001, None, {})
+            return {"ok": True, "spot_order_would_work": True}
+        except Exception as spot_error:
+            return {
+                "ok": False, 
+                "spot_error": str(spot_error),
+                "spot_symbol": spot_symbol,
+                "test_result": "This shows what error we get for SPOT trading with current permissions"
+            }
+            
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     app.logger.error(f"Unhandled exception: {e}\n{traceback.format_exc()}")
