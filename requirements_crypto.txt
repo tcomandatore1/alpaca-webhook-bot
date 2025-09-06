@@ -2,3 +2,6 @@ flask==3.0.3
 gunicorn==21.2.0
 python-dotenv==1.0.1
 ccxt==4.4.89
+PyJWT==2.10.1
+cryptography==45.0.6
+requests==2.32.4
