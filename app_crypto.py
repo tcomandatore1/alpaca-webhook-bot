@@ -69,9 +69,16 @@ def get_exchange():
 def _build_jwt(method: str, path: str) -> str:
     """Build JWT token for Coinbase API - SAME AS WORKING HFT BOT"""
     try:
-        # Remove quotes and handle the PEM key properly
+        # Handle PEM key format - convert \n to actual newlines if needed
         pem_key = COINBASE_API_SECRET.strip().strip('"')
+        
+        # If the PEM key contains literal \n characters (from Render), convert them to actual newlines
+        if '\\n' in pem_key:
+            pem_key = pem_key.replace('\\n', '\n')
+            app.logger.debug("Converted literal \\n to actual newlines")
+            
         app.logger.debug(f"PEM key starts with: {pem_key[:30]}...")
+        app.logger.debug(f"PEM key contains {pem_key.count(chr(10))} actual newlines")
         
         private_key = serialization.load_pem_private_key(pem_key.encode(), password=None)
         now = int(time.time())
