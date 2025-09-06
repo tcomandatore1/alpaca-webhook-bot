@@ -35,7 +35,28 @@ def get_exchange():
             "defaultType": "future"  # IMPORTANT for perps/futures
         }
     })
-    _exchange.load_markets()
+    
+    # Add better error handling for market loading
+    try:
+        app.logger.info("Loading markets...")
+        _exchange.load_markets()
+        
+        if SYMBOL not in _exchange.markets:
+            app.logger.error(f"Symbol {SYMBOL} not found in markets!")
+            # Log available ETH symbols for debugging
+            eth_symbols = [s for s in _exchange.markets.keys() if 'ETH' in s]
+            app.logger.error(f"Available ETH symbols: {eth_symbols}")
+            raise RuntimeError(f"Symbol {SYMBOL} not found")
+            
+        app.logger.info(f"✅ Symbol {SYMBOL} found in markets")
+        market = _exchange.markets[SYMBOL]
+        app.logger.info(f"Market details: type={market.get('type')}, active={market.get('active')}, contractSize={market.get('contractSize')}")
+        
+    except Exception as e:
+        app.logger.error(f"Failed to load markets: {e}")
+        _exchange = None
+        raise
+        
     return _exchange
 
 @app.get("/health")
@@ -56,6 +77,21 @@ def ccxtcheck():
         ex = get_exchange()
         ex.load_markets(reload=True)
         m = ex.markets.get(SYMBOL, {})
+        
+        # Test orderbook to verify connection
+        try:
+            orderbook = ex.fetch_order_book(SYMBOL, limit=5)
+            orderbook_ok = bool(orderbook.get('bids') and orderbook.get('asks'))
+            if orderbook_ok:
+                best_bid = orderbook['bids'][0][0]
+                best_ask = orderbook['asks'][0][0]
+            else:
+                best_bid = best_ask = None
+        except Exception as ob_err:
+            app.logger.error(f"Orderbook test failed: {ob_err}")
+            orderbook_ok = False
+            best_bid = best_ask = None
+        
         return {
             "ok": SYMBOL in ex.markets,
             "symbol": SYMBOL,
@@ -63,6 +99,9 @@ def ccxtcheck():
             "type": m.get("type"),
             "contractSize": m.get("contractSize"),
             "limits": m.get("limits"),
+            "orderbook_accessible": orderbook_ok,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
         }
     except Exception as e:
         app.logger.error("ccxtcheck error: %s\n%s", e, traceback.format_exc())
@@ -83,6 +122,7 @@ def tv():
     """
     try:
         data = request.get_json(force=True)
+        app.logger.info(f"📥 Received webhook: {data}")
     except Exception:
         return jsonify({"ok": False, "error": "invalid_json"}), 400
 
@@ -122,14 +162,58 @@ def tv():
 
     # Place MARKET order in CONTRACTS (ccxt handles mapping for futures)
     try:
+        app.logger.info(f"🚀 Creating order: {side.upper()} {contracts} contracts")
         ex = get_exchange()
+        
+        # Log the exact call we're making
+        app.logger.info(f"Calling: ex.create_order('{SYMBOL}', 'market', '{side}', {contracts}, None, {{'clientOrderId': '{client_order_id}'}})")
+        
         # Some venues accept a client order id via params; ccxt will pass it through if supported.
         params = {"clientOrderId": client_order_id}
+        
+        # This is where your "index out of range" error is likely happening
         order = ex.create_order(SYMBOL, "market", side, contracts, None, params)
+        
+        app.logger.info(f"✅ Order created successfully: {order}")
         return jsonify({"ok": True, "order": order, "sent": sent})
+        
     except Exception as e:
-        app.logger.error("order error: %s\n%s", e, traceback.format_exc())
-        return jsonify({"ok": False, "error": "exchange_error", "details": str(e), "sent": sent}), 400
+        # Enhanced error logging to pinpoint the issue
+        app.logger.error(f"❌ Order failed: {e}")
+        app.logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        error_info = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "sent_params": sent
+        }
+        
+        # Special handling for index out of range
+        if "index out of range" in str(e).lower():
+            app.logger.error("🚨 This is likely a ccxt parsing issue with Coinbase API response")
+            error_info["debug_hint"] = "ccxt may be having trouble parsing Coinbase's API response format"
+            
+        # Try to get more error context
+        if hasattr(e, 'args'):
+            error_info["error_args"] = e.args
+            
+        return jsonify({"ok": False, "error": "exchange_error", "details": error_info}), 400
+
+# Add global error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    app.logger.error(f"Unhandled exception: {e}\n{traceback.format_exc()}")
+    return jsonify({"ok": False, "error": "server_error", "message": str(e)}), 500
 
 if __name__ == "__main__":
+    # Enable better logging for debugging
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    
+    app.logger.info("🚀 Starting Render webhook server")
+    app.logger.info(f"Symbol: {SYMBOL}")
+    app.logger.info(f"Dry run mode: {DRY_RUN}")
+    app.logger.info(f"API key configured: {bool(COINBASE_API_KEY)}")
+    app.logger.info(f"API secret configured: {bool(COINBASE_API_SECRET)}")
+    
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
