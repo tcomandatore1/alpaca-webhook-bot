@@ -25,6 +25,9 @@ app = Flask(__name__)
 # Single shared exchange instance
 _exchange = None
 
+# Order tracking - maps order_id to Coinbase order details
+active_orders = {}
+
 def get_exchange():
     global _exchange
     if _exchange is not None:
@@ -139,6 +142,78 @@ def place_market_order_jwt(side: str, contracts: int, client_order_id: str) -> d
         app.logger.error(f"JWT REST API order failed: {e}")
         raise
 
+def place_limit_order_jwt(side: str, contracts: int, price: float, client_order_id: str) -> dict:
+    """Place limit order using JWT REST API"""
+    try:
+        # Get product_id from exchange
+        ex = get_exchange()
+        product_id = ex.markets[SYMBOL].get("id")
+        if not product_id:
+            raise RuntimeError(f"Could not get product_id for {SYMBOL}")
+        
+        # Build the limit order payload
+        base_size = str(int(contracts))
+        limit_price = str(float(price))  # Convert to string as required by API
+        
+        # Limit order configuration
+        oc = {"limit_limit_gtc": {"base_size": base_size, "limit_price": limit_price}}
+        payload = {
+            "client_order_id": client_order_id,
+            "product_id": product_id,
+            "side": side.upper(),
+            "order_configuration": oc
+        }
+        
+        # Make the REST API call with JWT
+        path = "/api/v3/brokerage/orders"
+        token = _build_jwt("POST", path)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        app.logger.info(f"🎯 JWT REST API LIMIT ORDER call: POST {path}")
+        app.logger.info(f"Payload: {payload}")
+        
+        r = requests.post(f"https://api.coinbase.com{path}", 
+                         headers=headers, 
+                         data=json.dumps(payload), 
+                         timeout=10)
+        r.raise_for_status()
+        resp = r.json()
+        
+        app.logger.info(f"✅ JWT REST API LIMIT ORDER response: {resp}")
+        return resp
+        
+    except Exception as e:
+        app.logger.error(f"JWT REST API LIMIT ORDER failed: {e}")
+        raise
+
+def cancel_order_jwt(coinbase_order_id: str) -> dict:
+    """Cancel order using JWT REST API"""
+    try:
+        # Make the REST API call with JWT
+        path = f"/api/v3/brokerage/orders/batch_cancel"
+        token = _build_jwt("POST", path)
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        # Coinbase batch cancel expects array of order IDs
+        payload = {"order_ids": [coinbase_order_id]}
+        
+        app.logger.info(f"🚫 JWT REST API CANCEL ORDER call: POST {path}")
+        app.logger.info(f"Payload: {payload}")
+        
+        r = requests.post(f"https://api.coinbase.com{path}", 
+                         headers=headers, 
+                         data=json.dumps(payload), 
+                         timeout=10)
+        r.raise_for_status()
+        resp = r.json()
+        
+        app.logger.info(f"✅ JWT REST API CANCEL ORDER response: {resp}")
+        return resp
+        
+    except Exception as e:
+        app.logger.error(f"JWT REST API CANCEL ORDER failed: {e}")
+        raise
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -195,10 +270,14 @@ def tv():
       "ticker": "ETH/USD:USD-301220",
       "action": "buy" | "sell" | "long" | "short",
       "order_id": "Long" | "Short" | "TP/SL",
-      "price": 2500,            # ignored for MARKET
+      "price": 2500,            # REQUIRED - uses LIMIT order at this price
       "contracts": 1,           # integer: number of contracts (1 = 0.1 ETH)
       "timestamp": "..."
     }
+    
+    LOGIC:
+    - ALWAYS places LIMIT orders using the price field
+    - Pine Script sends separate alerts for TP/SL hits with current price
     """
     try:
         data = request.get_json(force=True)
@@ -216,9 +295,44 @@ def tv():
         side = "buy"
     elif action in ("sell", "short"):
         side = "sell"
+    elif action == "cancel":
+        side = None  # Cancel action doesn't need side
     else:
         return jsonify({"ok": False, "error": "bad_side_value", "got": action}), 400
 
+    order_id = str(data.get("order_id", "")).strip()
+    
+    # Handle CANCEL action
+    if action == "cancel":
+        app.logger.info(f"🚫 Processing CANCEL request for order_id: {order_id}")
+        
+        # Check if we have this order tracked
+        if order_id not in active_orders:
+            app.logger.warning(f"Cancel requested for unknown order_id: {order_id}")
+            return jsonify({"ok": False, "error": "order_not_found", "order_id": order_id}), 400
+        
+        if DRY_RUN:
+            return jsonify({"ok": True, "dry_run": True, "would_cancel": order_id})
+        
+        # Cancel the order on Coinbase
+        try:
+            coinbase_order_id = active_orders[order_id]["coinbase_order_id"]
+            app.logger.info(f"🚫 Canceling Coinbase order: {coinbase_order_id} (Pine Script order_id: {order_id})")
+            
+            cancel_result = cancel_order_jwt(coinbase_order_id)
+            
+            # Remove from active orders tracking
+            del active_orders[order_id]
+            
+            app.logger.info(f"✅ Order canceled successfully: {cancel_result}")
+            return jsonify({"ok": True, "cancel_result": cancel_result, "order_id": order_id, "method": "jwt_cancel_order"})
+            
+        except Exception as e:
+            app.logger.error(f"❌ Cancel order failed: {e}")
+            app.logger.error(f"Full traceback: {traceback.format_exc()}")
+            return jsonify({"ok": False, "error": "cancel_failed", "order_id": order_id, "details": str(e)}), 400
+
+    # Handle BUY/SELL actions (require contracts and price)
     try:
         contracts = int(data.get("contracts"))
         if contracts <= 0:
@@ -226,47 +340,71 @@ def tv():
     except Exception:
         return jsonify({"ok": False, "error": "contracts_must_be_positive_int"}), 400
 
-    base_id = str(data.get("order_id") or "tv").replace(" ", "_")
+    # Get price - REQUIRED for all orders
+    price = data.get("price")
+    
+    # Convert price to float - REQUIRED field
+    try:
+        limit_price = float(price)
+        if limit_price <= 0:
+            raise ValueError("Price must be positive")
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "valid_price_required", "got": price}), 400
+    
+    base_id = str(order_id or "tv").replace(" ", "_")
     client_order_id = f"{base_id}-{uuid.uuid4().hex[:8]}"[:64]
 
     sent = {
         "symbol": SYMBOL,
-        "type": "market",
+        "type": "limit",
         "side": side,
         "amount_contracts": contracts,
-        "client_order_id": client_order_id
+        "client_order_id": client_order_id,
+        "price": limit_price,
+        "order_id": order_id
     }
 
     if DRY_RUN:
         return jsonify({"ok": True, "dry_run": True, "would_send": sent})
 
-    # Place MARKET order using JWT REST API (SAME AS WORKING HFT BOT)
+    # ALWAYS place LIMIT order
     try:
-        app.logger.info(f"🚀 Creating order: {side.upper()} {contracts} contracts using JWT REST API")
+        app.logger.info(f"🎯 Creating LIMIT order: {side.upper()} {contracts} contracts at ${limit_price} (order_id: {order_id})")
+        order_result = place_limit_order_jwt(side, contracts, limit_price, client_order_id)
         
-        # Use the same method as your working HFT bot
-        order_result = place_market_order_jwt(side, contracts, client_order_id)
+        # Track the order for potential cancellation
+        coinbase_order_id = order_result.get("order_id")  # Coinbase returns order_id in response
+        if coinbase_order_id and order_id in ["Long", "Short"]:  # Only track entry orders that can be canceled
+            active_orders[order_id] = {
+                "coinbase_order_id": coinbase_order_id,
+                "client_order_id": client_order_id,
+                "side": side,
+                "contracts": contracts,
+                "price": limit_price,
+                "timestamp": time.time()
+            }
+            app.logger.info(f"📊 Tracking order: {order_id} -> {coinbase_order_id}")
         
-        app.logger.info(f"✅ Order created successfully via JWT: {order_result}")
-        return jsonify({"ok": True, "order": order_result, "sent": sent, "method": "jwt_rest_api"})
+        app.logger.info(f"✅ LIMIT Order created successfully: {order_result}")
+        return jsonify({"ok": True, "order": order_result, "sent": sent, "method": "jwt_limit_order"})
         
     except Exception as e:
         # Enhanced error logging
-        app.logger.error(f"❌ JWT REST API Order failed: {e}")
+        app.logger.error(f"❌ LIMIT Order failed: {e}")
         app.logger.error(f"Full traceback: {traceback.format_exc()}")
         
         error_info = {
             "error_type": type(e).__name__,
             "error_message": str(e),
             "sent_params": sent,
-            "method": "jwt_rest_api"
+            "method": "jwt_limit_order"
         }
         
         # Try to get more error context
         if hasattr(e, 'args'):
             error_info["error_args"] = e.args
             
-        return jsonify({"ok": False, "error": "jwt_rest_api_error", "details": error_info}), 400
+        return jsonify({"ok": False, "error": "jwt_limit_order_error", "details": error_info}), 400
 
 # Add global error handler
 @app.get("/spottest")
@@ -298,6 +436,40 @@ def spottest():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.get("/test-limit")
+def test_limit():
+    """Test endpoint to verify limit order functionality"""
+    try:
+        ex = get_exchange()
+        
+        # Get current price to set a reasonable limit price
+        ticker = ex.fetch_ticker(SYMBOL)
+        current_price = ticker['last']
+        
+        # Set limit price 1% below current for buy (won't execute immediately)
+        test_limit_price = current_price * 0.99
+        
+        return {
+            "ok": True,
+            "current_price": current_price,
+            "test_limit_price": test_limit_price,
+            "symbol": SYMBOL,
+            "message": f"Limit order test price would be ${test_limit_price:.2f} (1% below current ${current_price:.2f})"
+        }
+        
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/active-orders")
+def get_active_orders():
+    """View currently tracked orders (for debugging)"""
+    return {
+        "ok": True,
+        "active_orders": active_orders,
+        "count": len(active_orders),
+        "timestamp": time.time()
+    }
+
 @app.errorhandler(Exception)
 def handle_exception(e):
     app.logger.error(f"Unhandled exception: {e}\n{traceback.format_exc()}")
@@ -308,10 +480,16 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
     
-    app.logger.info("🚀 Starting Render webhook server")
+    app.logger.info("🚀 Starting Render webhook server with LIMIT ORDER & CANCEL support")
     app.logger.info(f"Symbol: {SYMBOL}")
     app.logger.info(f"Dry run mode: {DRY_RUN}")
     app.logger.info(f"API key configured: {bool(COINBASE_API_KEY)}")
     app.logger.info(f"API secret configured: {bool(COINBASE_API_SECRET)}")
+    app.logger.info("📋 Order Logic:")
+    app.logger.info("  - BUY/SELL webhooks → LIMIT ORDERS (at price from Pine Script)")
+    app.logger.info("  - CANCEL webhooks → CANCEL tracked orders on Coinbase")
+    app.logger.info("  - Entry signals: Long/Short at calculated entry price")
+    app.logger.info("  - Exit signals: TP/SL at current market price")
+    app.logger.info("  - Cancel signals: After X candles if not filled")
     
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
