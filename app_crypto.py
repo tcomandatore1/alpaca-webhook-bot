@@ -373,7 +373,7 @@ def tv():
         order_result = place_limit_order_jwt(side, contracts, limit_price, client_order_id)
         
         # Track the order for potential cancellation
-        coinbase_order_id = order_result.get("order_id")  # Coinbase returns order_id in response
+        coinbase_order_id = order_result.get("success_response", {}).get("order_id")  # Coinbase returns order_id in nested response
         if coinbase_order_id and order_id in ["Long", "Short"]:  # Only track entry orders that can be canceled
             active_orders[order_id] = {
                 "coinbase_order_id": coinbase_order_id,
@@ -384,6 +384,8 @@ def tv():
                 "timestamp": time.time()
             }
             app.logger.info(f"📊 Tracking order: {order_id} -> {coinbase_order_id}")
+        else:
+            app.logger.warning(f"⚠️  Could not extract order_id for tracking. Response: {order_result}")
         
         app.logger.info(f"✅ LIMIT Order created successfully: {order_result}")
         return jsonify({"ok": True, "order": order_result, "sent": sent, "method": "jwt_limit_order"})
